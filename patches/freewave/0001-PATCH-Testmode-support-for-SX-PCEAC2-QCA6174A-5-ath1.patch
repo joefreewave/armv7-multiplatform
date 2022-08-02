@@ -1,0 +1,372 @@
+From da2d683c82a950207fcd6d40daa8c9945e6e2a9c Mon Sep 17 00:00:00 2001
+From: Joe Turner <joe@agavemountain.com>
+Date: Tue, 2 Aug 2022 11:55:07 -0500
+Subject: [PATCH] [PATCH] Testmode support for SX-PCEAC2(QCA6174A-5)-ath10k
+
+Modified ath10k-testmode to support tlv based chipset SX-PCEAC2 Module(QCA6174A-5).
+---
+ drivers/net/wireless/ath/ath10k/core.h     |  11 +
+ drivers/net/wireless/ath/ath10k/testmode.c | 233 ++++++++++++++++++++-
+ drivers/net/wireless/ath/ath10k/wmi-tlv.h  |  10 +
+ 3 files changed, 250 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath10k/core.h b/drivers/net/wireless/ath/ath10k/core.h
+index 8bfabbcfdb14..12800ca50dee 100644
+--- a/drivers/net/wireless/ath/ath10k/core.h
++++ b/drivers/net/wireless/ath/ath10k/core.h
+@@ -995,6 +995,15 @@ struct ath10k_per_peer_tx_stats {
+ 	u32	reserved2;
+ };
+ 
++struct ath10k_utf_event_info {
++	u8 *data;
++	u32 length;
++	size_t offset;
++	u8 current_seq;
++	u8 expected_seq;
++};
++
++
+ enum ath10k_dev_type {
+ 	ATH10K_DEV_TYPE_LL,
+ 	ATH10K_DEV_TYPE_HL,
+@@ -1248,6 +1257,8 @@ struct ath10k {
+ 		/* protected by conf_mutex */
+ 		struct ath10k_fw_components utf_mode_fw;
+ 
++		struct ath10k_utf_event_info utf_event;
++
+ 		/* protected by data_lock */
+ 		bool utf_monitor;
+ 	} testmode;
+diff --git a/drivers/net/wireless/ath/ath10k/testmode.c b/drivers/net/wireless/ath/ath10k/testmode.c
+index 7a9b9bbcdbfc..ea22c9c21d41 100644
+--- a/drivers/net/wireless/ath/ath10k/testmode.c
++++ b/drivers/net/wireless/ath/ath10k/testmode.c
+@@ -10,6 +10,7 @@
+ 
+ #include "debug.h"
+ #include "wmi.h"
++#include "wmi-tlv.h"
+ #include "hif.h"
+ #include "hw.h"
+ #include "core.h"
+@@ -25,6 +26,99 @@ static const struct nla_policy ath10k_tm_policy[ATH10K_TM_ATTR_MAX + 1] = {
+ 	[ATH10K_TM_ATTR_VERSION_MINOR]	= { .type = NLA_U32 },
+ };
+ 
++static int
++ath10k_tm_process_wmi_tlv_event(struct ath10k *ar,  struct sk_buff *skb)
++{
++	struct wmi_tlv_seg_hdr_info seg_hdr_info;
++	struct wmi_tlv *tlv = NULL;
++	struct sk_buff *nl_skb = NULL;
++	u32 data_len;
++	u8 *pdata;
++	u8 total_segments, current_seq;
++	int ret = 0;
++
++	pdata =  (u8 *)(skb->data) + sizeof(*tlv);
++
++	tlv = (struct wmi_tlv *)(skb->data);
++	data_len = __le16_to_cpu(tlv->len);
++
++	if (data_len < sizeof(seg_hdr_info)) {
++		ath10k_err(ar,
++		"testmode event data size %d is smaller than wmi_tlv_seg_hdr_info",
++		data_len);
++		return -EINVAL;
++	}
++
++	seg_hdr_info = *((struct wmi_tlv_seg_hdr_info *)pdata);
++
++	ar->testmode.utf_event.current_seq = (seg_hdr_info.segment_info & 0xF);
++
++	current_seq = (seg_hdr_info.segment_info & 0xF);
++	total_segments = (seg_hdr_info.segment_info >> 4) & 0xF;
++
++	data_len = data_len - sizeof(seg_hdr_info);
++
++	if (current_seq == 0) {
++		ar->testmode.utf_event.expected_seq = 0;
++		ar->testmode.utf_event.offset = 0;
++		ar->testmode.utf_event.length = 0;
++	} else {
++		if (ar->testmode.utf_event.expected_seq != current_seq)
++			ath10k_warn(ar,
++			"testmode event: mismatch in seq -- expected seq %d got seq %d",
++			ar->testmode.utf_event.expected_seq, current_seq);
++	}
++
++	if ((data_len > WMI_TLV_MAX_UTF_EVENT_LENGTH) ||
++		(ar->testmode.utf_event.offset >
++		(WMI_TLV_MAX_UTF_EVENT_LENGTH - data_len))) {
++		ath10k_err(ar, "testmode event: excess data from firmware, offset:%zu, len:%d",
++			ar->testmode.utf_event.offset, data_len);
++		return -EINVAL;
++	}
++
++	memcpy(&ar->testmode.utf_event.data[ar->testmode.utf_event.offset],
++			&pdata[sizeof(seg_hdr_info)], data_len);
++
++	ar->testmode.utf_event.offset =
++		ar->testmode.utf_event.offset + data_len;
++	ar->testmode.utf_event.expected_seq++;
++
++	if (ar->testmode.utf_event.expected_seq == total_segments) {
++		if (ar->testmode.utf_event.offset != seg_hdr_info.len)
++			ath10k_warn(ar,
++				"testmode event: all segs received total len mismatch.. len %zu total len %d",
++				ar->testmode.utf_event.offset,
++				seg_hdr_info.len);
++		ar->testmode.utf_event.length = ar->testmode.utf_event.offset;
++	}
++
++	if (!ar->testmode.utf_event.length)
++		goto out;
++
++	nl_skb = cfg80211_testmode_alloc_event_skb
++		(ar->hw->wiphy, ar->testmode.utf_event.length, GFP_ATOMIC);
++	if (!nl_skb) {
++		ath10k_warn(ar, "failed to allocate skb for testmode utf event\n");
++		goto out;
++	}
++
++	ret = nla_put(nl_skb, ATH10K_TM_ATTR_DATA,
++			ar->testmode.utf_event.length,
++			ar->testmode.utf_event.data);
++	if (ret) {
++		ath10k_warn(ar,
++			"failed to copy testmode event data to nl_event: %d\n",
++			ret);
++		kfree_skb(nl_skb);
++		goto out;
++	}
++
++	cfg80211_testmode_event(nl_skb, GFP_ATOMIC);
++out:
++	return 0;
++}
++
+ /* Returns true if callee consumes the skb and the skb should be discarded.
+  * Returns false if skb is not used. Does not sleep.
+  */
+@@ -53,6 +147,19 @@ bool ath10k_tm_event_wmi(struct ath10k *ar, u32 cmd_id, struct sk_buff *skb)
+ 	 */
+ 	consumed = true;
+ 
++	if (ar->target_version == QCA6174_HW_3_2_VERSION) {
++		if ((cmd_id == WMI_TLV_READY_EVENTID) ||
++				(cmd_id == WMI_TLV_SERVICE_READY_EVENTID))
++			goto out;
++		ret = ath10k_tm_process_wmi_tlv_event(ar, skb);
++		if (ret) {
++			ath10k_err(ar,
++				"failed to process utf_event for tlv based device: ret: %d\n",
++				ret);
++		}
++		goto out;
++	}
++
+ 	nl_skb = cfg80211_testmode_alloc_event_skb(ar->hw->wiphy,
+ 						   2 * sizeof(u32) + skb->len,
+ 						   GFP_ATOMIC);
+@@ -162,8 +269,14 @@ static int ath10k_tm_fetch_utf_firmware_api_1(struct ath10k *ar,
+ 	 * correct WMI interface.
+ 	 */
+ 
+-	fw_file->wmi_op_version = ATH10K_FW_WMI_OP_VERSION_10_1;
+-	fw_file->htt_op_version = ATH10K_FW_HTT_OP_VERSION_10_1;
++	if (ar->target_version == QCA6174_HW_3_2_VERSION) {
++		fw_file->wmi_op_version = ATH10K_FW_WMI_OP_VERSION_TLV;
++		fw_file->htt_op_version = ATH10K_FW_HTT_OP_VERSION_TLV;
++	} else {
++		fw_file->wmi_op_version = ATH10K_FW_WMI_OP_VERSION_10_1;
++		fw_file->htt_op_version = ATH10K_FW_HTT_OP_VERSION_10_1;
++	}
++
+ 	fw_file->firmware_data = fw_file->firmware->data;
+ 	fw_file->firmware_len = fw_file->firmware->size;
+ 
+@@ -267,6 +380,15 @@ static int ath10k_tm_cmd_utf_start(struct ath10k *ar, struct nlattr *tb[])
+ 		}
+ 	}
+ 
++	ar->testmode.utf_event.data = kzalloc(WMI_TLV_MAX_UTF_EVENT_LENGTH,
++				GFP_KERNEL);
++	if (!ar->testmode.utf_event.data) {
++		ret = -ENOMEM;
++		goto err_release_utf_mode_fw;
++	}
++
++	ar->testmode.utf_event.length = 0;
++
+ 	spin_lock_bh(&ar->data_lock);
+ 	ar->testmode.utf_monitor = true;
+ 	spin_unlock_bh(&ar->data_lock);
+@@ -278,7 +400,7 @@ static int ath10k_tm_cmd_utf_start(struct ath10k *ar, struct nlattr *tb[])
+ 	if (ret) {
+ 		ath10k_err(ar, "failed to power up hif (testmode): %d\n", ret);
+ 		ar->state = ATH10K_STATE_OFF;
+-		goto err_release_utf_mode_fw;
++		goto err_release_utf_event;
+ 	}
+ 
+ 	ret = ath10k_core_start(ar, ATH10K_FIRMWARE_MODE_UTF,
+@@ -305,6 +427,9 @@ static int ath10k_tm_cmd_utf_start(struct ath10k *ar, struct nlattr *tb[])
+ err_power_down:
+ 	ath10k_hif_power_down(ar);
+ 
++err_release_utf_event:
++	kfree(ar->testmode.utf_event.data);
++
+ err_release_utf_mode_fw:
+ 	if (ar->testmode.utf_mode_fw.fw_file.codeswap_data &&
+ 	    ar->testmode.utf_mode_fw.fw_file.codeswap_len)
+@@ -333,6 +458,12 @@ static void __ath10k_tm_cmd_utf_stop(struct ath10k *ar)
+ 
+ 	spin_unlock_bh(&ar->data_lock);
+ 
++	if (ar->testmode.utf_event.data) {
++		kfree(ar->testmode.utf_event.data);
++		ar->testmode.utf_event.data = NULL;
++		ar->testmode.utf_event.length = 0;
++	}
++
+ 	if (ar->testmode.utf_mode_fw.fw_file.codeswap_data &&
+ 	    ar->testmode.utf_mode_fw.fw_file.codeswap_len)
+ 		ath10k_swap_code_seg_release(ar,
+@@ -368,6 +499,97 @@ static int ath10k_tm_cmd_utf_stop(struct ath10k *ar, struct nlattr *tb[])
+ 	return ret;
+ }
+ 
++static int ath10k_tm_cmd_wmi_tlv(struct ath10k *ar, struct nlattr *tb[])
++{
++	struct wmi_tlv_seg_hdr_info seg_hdr_info;
++	struct sk_buff *skb;
++	struct wmi_tlv *tlv = NULL;
++	u8 *pcmd = NULL;
++	u8 *buf_pos;
++	void *buf;
++	u32 buf_len, total_len;
++	u16 seg_len;
++	static u8 msg_ref = 1;
++	u8 seg_num = 0, seg_info, num_segments;
++	int ret = 0;
++
++	mutex_lock(&ar->conf_mutex);
++
++	if (ar->state != ATH10K_STATE_UTF) {
++		ret = -ENETDOWN;
++		goto out;
++	}
++
++	if (!tb[ATH10K_TM_ATTR_DATA]) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	buf = nla_data(tb[ATH10K_TM_ATTR_DATA]);
++	buf_len = nla_len(tb[ATH10K_TM_ATTR_DATA]);
++
++	buf_pos = (u8 *)buf;
++	total_len = buf_len;
++
++	num_segments = (u8)(total_len / WMI_TLV_MAX_UTF_LEN);
++
++	if (buf_len - (num_segments * WMI_TLV_MAX_UTF_LEN))
++		num_segments++;
++
++	while (buf_len) {
++		if (buf_len > WMI_TLV_MAX_UTF_LEN)
++			seg_len = WMI_TLV_MAX_UTF_LEN; /* MAX messsage */
++		else
++			seg_len = buf_len;
++
++		skb = ath10k_wmi_alloc_skb(ar, (seg_len + sizeof(seg_hdr_info)
++					+ sizeof(*tlv)));
++		if (!skb) {
++			ret = -ENOMEM;
++			goto out;
++		}
++
++		tlv = (struct wmi_tlv *)(skb->data);
++
++		tlv->tag = __cpu_to_le16(WMI_TLV_TAG_ARRAY_BYTE);
++		tlv->len = __cpu_to_le16(seg_len + sizeof(seg_hdr_info));
++
++		pcmd = ((u8 *)skb->data) + sizeof(*tlv);
++
++		seg_hdr_info.len = total_len;
++		seg_hdr_info.msgref = msg_ref;
++
++		seg_info = ((num_segments << 4) & 0xF0) | (seg_num & 0xF);
++		seg_hdr_info.segment_info = seg_info;
++
++		seg_hdr_info.pad = 0;
++
++		seg_num++;
++
++		memcpy(pcmd, &seg_hdr_info, sizeof(seg_hdr_info)); /* 4 bytes */
++		memcpy(&pcmd[sizeof(seg_hdr_info)], buf_pos, seg_len);
++
++		ret = ath10k_wmi_cmd_send(ar, skb, ar->wmi.cmd->pdev_utf_cmdid);
++		if (ret) {
++			ath10k_warn(ar,
++				"failed to transmit wmi command (testmode): %d\n",
++				ret);
++			goto out;
++		}
++
++		buf_len -= seg_len;
++		buf_pos += seg_len;
++	}
++
++	msg_ref++;
++
++	ret = 0;
++
++out:
++	mutex_unlock(&ar->conf_mutex);
++	return ret;
++}
++
+ static int ath10k_tm_cmd_wmi(struct ath10k *ar, struct nlattr *tb[])
+ {
+ 	struct sk_buff *skb;
+@@ -447,7 +669,10 @@ int ath10k_tm_cmd(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 	case ATH10K_TM_CMD_UTF_STOP:
+ 		return ath10k_tm_cmd_utf_stop(ar, tb);
+ 	case ATH10K_TM_CMD_WMI:
+-		return ath10k_tm_cmd_wmi(ar, tb);
++		if (ar->target_version == QCA6174_HW_3_2_VERSION)
++			return ath10k_tm_cmd_wmi_tlv(ar, tb);
++		else
++			return ath10k_tm_cmd_wmi(ar, tb);
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+diff --git a/drivers/net/wireless/ath/ath10k/wmi-tlv.h b/drivers/net/wireless/ath/ath10k/wmi-tlv.h
+index b39c9b78b32b..1b435fe6abf4 100644
+--- a/drivers/net/wireless/ath/ath10k/wmi-tlv.h
++++ b/drivers/net/wireless/ath/ath10k/wmi-tlv.h
+@@ -2415,6 +2415,16 @@ struct wmi_tlv_rfkill_state_change_ev {
+ 	__le32 radio_state;
+ };
+ 
++#define WMI_TLV_MAX_UTF_EVENT_LENGTH	2048
++#define WMI_TLV_MAX_UTF_LEN		252
++
++struct wmi_tlv_seg_hdr_info {
++	u32 len;
++	u32 msgref;
++	u32 segment_info;
++	u32 pad;
++};
++
+ void ath10k_wmi_tlv_attach(struct ath10k *ar);
+ 
+ enum wmi_nlo_auth_algorithm {
+-- 
+2.25.1
+
