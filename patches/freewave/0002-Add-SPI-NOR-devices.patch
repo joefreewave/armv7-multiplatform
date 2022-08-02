@@ -1,0 +1,43 @@
+From 44bb106bbfc9696f595bd067ea4d520282e80ea0 Mon Sep 17 00:00:00 2001
+From: Joe Turner <jturner@freewave.com>
+Date: Mon, 1 Aug 2022 22:59:34 -0500
+Subject: [PATCH 2/3] Add SPI/NOR devices
+
+Added SPI/NOR devices
+---
+ drivers/mtd/spi-nor/issi.c     | 3 +++
+ drivers/mtd/spi-nor/macronix.c | 4 ++++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/drivers/mtd/spi-nor/issi.c b/drivers/mtd/spi-nor/issi.c
+index c012bc2486e1..9fe28ab33998 100644
+--- a/drivers/mtd/spi-nor/issi.c
++++ b/drivers/mtd/spi-nor/issi.c
+@@ -33,6 +33,9 @@ static const struct flash_info issi_nor_parts[] = {
+ 	/* ISSI */
+ 	{ "is25cd512",  INFO(0x7f9d20, 0, 32 * 1024,   2)
+ 		NO_SFDP_FLAGS(SECT_4K) },
++//IPS +2
++	{ "is25wp080d", INFO(0x9d7014, 0, 64 * 1024, 32 )
++		NO_SFDP_FLAGS( SECT_4K | SPI_NOR_DUAL_READ | SPI_NOR_QUAD_READ | SPI_NOR_HAS_LOCK) },
+ 	{ "is25lq040b", INFO(0x9d4013, 0, 64 * 1024,   8)
+ 		NO_SFDP_FLAGS(SECT_4K | SPI_NOR_DUAL_READ | SPI_NOR_QUAD_READ) },
+ 	{ "is25lp016d", INFO(0x9d6015, 0, 64 * 1024,  32)
+diff --git a/drivers/mtd/spi-nor/macronix.c b/drivers/mtd/spi-nor/macronix.c
+index d81a4cb2812b..2c60c9128c81 100644
+--- a/drivers/mtd/spi-nor/macronix.c
++++ b/drivers/mtd/spi-nor/macronix.c
+@@ -49,6 +49,10 @@ static const struct flash_info macronix_nor_parts[] = {
+ 		NO_SFDP_FLAGS(SECT_4K) },
+ 	{ "mx25l6405d",  INFO(0xc22017, 0, 64 * 1024, 128)
+ 		NO_SFDP_FLAGS(SECT_4K) },
++//IPS +1
++	{ "mx25v8035f",  INFO(0xc22314, 0, 64 * 1024,  16)
++		NO_SFDP_FLAGS(SECT_4K | SPI_NOR_DUAL_READ | SPI_NOR_QUAD_READ) },
++
+ 	{ "mx25u2033e",  INFO(0xc22532, 0, 64 * 1024,   4)
+ 		NO_SFDP_FLAGS(SECT_4K) },
+ 	{ "mx25u3235f",	 INFO(0xc22536, 0, 64 * 1024,  64)
+-- 
+2.34.1
+

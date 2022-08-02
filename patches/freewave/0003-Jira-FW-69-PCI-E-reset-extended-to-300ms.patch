@@ -1,0 +1,39 @@
+From 4d1778970710d82eb659284e059da8ae8b5753f0 Mon Sep 17 00:00:00 2001
+From: Joe Turner <jturner@freewave.com>
+Date: Mon, 1 Aug 2022 22:49:19 -0500
+Subject: [PATCH 3/3] Jira FW-69: PCI-E reset extended to 300ms
+
+This change was applied to the 4.x kernel.  Added to the 5.x kernel.
+
+Comment:
+
+CLN to mitigate FreeWave Jira FW-69, hardware engineering requested
+the reset be extended to 300ms.  This was seen to allow NL-SW-LTE-TC4NAG
+to operate correctly after reboot.
+---
+ drivers/pci/controller/dwc/pci-imx6.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/drivers/pci/controller/dwc/pci-imx6.c b/drivers/pci/controller/dwc/pci-imx6.c
+index 7a285fb0f619..b08fd19e6704 100644
+--- a/drivers/pci/controller/dwc/pci-imx6.c
++++ b/drivers/pci/controller/dwc/pci-imx6.c
+@@ -597,7 +597,15 @@ static void imx6_pcie_deassert_core_reset(struct imx6_pcie *imx6_pcie)
+ 		gpio_set_value_cansleep(imx6_pcie->reset_gpio,
+ 					!imx6_pcie->gpio_active_high);
+ 		/* Wait for 100ms after PERST# deassertion (PCIe r5.0, 6.6.1) */
++#if 1
++		/* CLN To mitigate FreeWave Jira FW-69, hardware eng requested the
++		 * reset be extended to 300 ms. This was seen to allow the
++		 * NL-SW-LTE-TC4NAG to operate correctly after reboot.
++		 */
++		msleep(300);
++#else
+ 		msleep(100);
++#endif
+ 	}
+ 
+ 	return;
+-- 
+2.34.1
+
